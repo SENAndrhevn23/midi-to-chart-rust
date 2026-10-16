@@ -1,0 +1,15 @@
+[package]
+name = "midi-to-psych-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Rust GUI MIDI to Psych Engine chart converter"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.30", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "android-native-activity"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
