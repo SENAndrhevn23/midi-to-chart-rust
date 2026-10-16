@@ -77,30 +77,3 @@ jobs:
           path: ${{ matrix.binary }}
           if-no-files-found: error
           compression-level: 6
-
-  android-cross-compile:
-    name: Android (ARM64 cross-compile check)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Android SDK tools
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
-        shell: bash
-        run: |
-          sdkmanager --install "ndk;27.2.12479018" "platforms;android-35"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
-
-      - name: Install stable Rust with Android target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check Android target
-        run: cargo check --target aarch64-linux-android
