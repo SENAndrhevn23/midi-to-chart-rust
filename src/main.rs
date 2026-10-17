@@ -482,6 +482,7 @@ fn write_chart_json<W: Write>(
     min_pitch: u8,
     max_pitch: u8,
     compact_sections: bool,
+    output_song_id: &str,
 ) -> io::Result<()> {
     if notes.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "No notes were selected."));
@@ -494,7 +495,7 @@ fn write_chart_json<W: Write>(
     let start_section = if compact_sections { first_note_section } else { 0 };
 
     writer.write_all(b"{\"song\":{\"song\":")?;
-    serde_json::to_writer(&mut *writer, &plan.song)
+    serde_json::to_writer(&mut *writer, output_song_id)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     writer.write_all(b",\"notes\":[")?;
 
@@ -584,6 +585,7 @@ fn write_chart_file(
     max_pitch: u8,
     compact_sections: bool,
     byte_limit: u64,
+    output_song_id: &str,
 ) -> Result<u64, String> {
     use std::fs::OpenOptions;
     let file = OpenOptions::new().write(true).create_new(true).open(path)
@@ -591,7 +593,7 @@ fn write_chart_file(
     let mut writer = BufWriter::with_capacity(1024 * 1024, LimitWriter {
         inner: file, limit: byte_limit, written: 0, exceeded: false,
     });
-    let write_result = write_chart_json(&mut writer, plan, notes, pitch_map, min_pitch, max_pitch, compact_sections);
+    let write_result = write_chart_json(&mut writer, plan, notes, pitch_map, min_pitch, max_pitch, compact_sections, output_song_id);
     let flush_result = writer.flush();
     let limit_hit = writer.get_ref().exceeded;
     drop(writer);
@@ -712,17 +714,8 @@ impl App {
 
     fn choose(&mut self, first:bool) {
         if self.load_rx.is_some() { return; }
-        #[cfg(target_os = "android")]
-        {
-            let _ = first;
-            self.status = "Android file selection is not connected yet. This workflow only checks that the Rust code cross-compiles for Android; use the desktop build to import MIDI files.".into();
-            self.error = true;
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            if let Some(path)=rfd::FileDialog::new().add_filter("MIDI files",&["mid","midi"]).pick_file() {
-                self.start_midi_load(first, path);
-            }
+        if let Some(path)=rfd::FileDialog::new().add_filter("MIDI files", &["mid", "midi"]).pick_file() {
+            self.start_midi_load(first, path);
         }
     }
 
@@ -760,26 +753,17 @@ impl App {
         }
     }
     fn choose_audio(&mut self, instrumental: bool) {
-        #[cfg(target_os = "android")]
-        {
-            let _ = instrumental;
-            self.status = "Android file selection is not connected yet. The Android workflow is a cross-compile check, not a usable APK.".into();
-            self.error = true;
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let title = if instrumental { "Select instrumental audio (Inst.ogg)" } else { "Select vocals audio (optional)" };
-            if let Some(path) = rfd::FileDialog::new().set_title(title).add_filter("OGG audio", &["ogg"]).pick_file() {
-                if !path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ogg")).unwrap_or(false) {
-                    self.status = "Please choose an .ogg audio file.".into();
-                    self.error = true;
-                    return;
-                }
-                if instrumental { self.inst_audio = Some(path); }
-                else { self.vocals_audio = Some(path); }
-                self.status = if instrumental { "Instrumental audio selected." } else { "Vocals audio selected; it will be exported as Voices.ogg for Psych Engine." }.into();
-                self.error = false;
+        let title = if instrumental { "Select instrumental audio (Inst.ogg)" } else { "Select vocals audio (optional)" };
+        if let Some(path) = rfd::FileDialog::new().set_title(title).add_filter("OGG audio", &["ogg"]).pick_file() {
+            if !path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ogg")).unwrap_or(false) {
+                self.status = "Please choose an .ogg audio file.".into();
+                self.error = true;
+                return;
             }
+            if instrumental { self.inst_audio = Some(path); }
+            else { self.vocals_audio = Some(path); }
+            self.status = if instrumental { "Instrumental audio selected." } else { "Vocals audio selected; it will be exported as Voices.ogg for Psych Engine." }.into();
+            self.error = false;
         }
     }
     fn export(&mut self) {
@@ -822,13 +806,6 @@ impl App {
             }
             return;
         }
-        #[cfg(target_os = "android")]
-        let destination: PathBuf = {
-            self.status = "Android folder selection/export is not connected yet. This Android job only verifies cross-compilation; it does not create an installable APK.".into();
-            self.error = true;
-            return;
-        };
-        #[cfg(not(target_os = "android"))]
         let destination = match rfd::FileDialog::new()
             .set_directory(self.output.as_deref().unwrap_or(Path::new(".")))
             .set_title("Choose where to create the Psych Engine mod folder")
@@ -893,7 +870,7 @@ impl App {
         self.output=Some(plan.destination.clone());
         let id=song_id(&plan.song);
         let split_note=if parts>1 {
-            format!("\nJSON split into {parts} files ({} total).\nImportant: stock Psych Engine does not automatically merge split chart files; see data/{id}/{id}.split-manifest.json.",pretty_bytes(total_bytes))
+            format!("\nSplit into {parts} separate song entries ({} total chart JSON).\nEach part has its own chart and audio folder and is listed in weeks/week-{id}.json. Each part uses the full original audio but contains only its assigned notes. Manifest: data/{id}/{id}.split-manifest.json.",pretty_bytes(total_bytes))
         } else { String::new() };
         self.status=format!(
             "Psych Engine mod exported successfully!\n{}\n\nChart: data/{id}/{id}.json\nAudio: songs/{id}/Inst.ogg{}\nWeek: weeks/week-{id}.json{}",
@@ -917,7 +894,7 @@ impl App {
             let temp_path = unique_temp_path(&plan.destination, "chart");
             let byte_limit = if ignore_selected_cap { MAX_JSON_BYTES } else { plan.cap.bytes().min(MAX_JSON_BYTES) };
             match write_chart_file(
-                &temp_path, plan, &plan.notes, pitch_map, min_pitch, max_pitch, false, byte_limit,
+                &temp_path, plan, &plan.notes, pitch_map, min_pitch, max_pitch, false, byte_limit, &plan.song,
             ) {
                 Ok(bytes) => Some((temp_path, bytes)),
                 Err(e) if e.starts_with("SPLIT_REQUIRED:") => return Err(e),
@@ -933,38 +910,56 @@ impl App {
                 fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
             }
             let id = song_id(&plan.song);
-            let data_dir = folder.join("data").join(&id);
-            fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+            let data_root = folder.join("data");
+            fs::create_dir_all(&data_root).map_err(|e| e.to_string())?;
 
             let mut part_metadata: Vec<serde_json::Value> = Vec::new();
+            let mut song_ids: Vec<String> = Vec::new();
             let mut total_bytes = 0u64;
             let mut part_count = 0usize;
             if let Some((temp_path, bytes)) = single_temp.as_ref() {
+                let data_dir = data_root.join(&id);
+                fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
                 let final_path = data_dir.join(format!("{id}.json"));
                 if final_path.exists() { fs::remove_file(&final_path).map_err(|e| e.to_string())?; }
                 fs::rename(temp_path, &final_path).map_err(|e| format!("Couldn't move completed chart JSON into the mod folder: {e}"))?;
                 total_bytes = *bytes;
                 part_count = 1;
+                song_ids.push(id.clone());
                 part_metadata.push(serde_json::json!({
-                    "file": format!("{id}.json"), "bytes": bytes, "notes": plan.notes.len(),
+                    "songId": id,
+                    "file": format!("data/{id}/{id}.json"), "bytes": bytes, "notes": plan.notes.len(),
                     "firstNoteMs": plan.notes.first().map(|n| n.ms),
                     "lastNoteMs": plan.notes.last().map(|n| n.ms)
                 }));
             } else {
                 let cap = plan.cap.bytes().min(MAX_JSON_BYTES);
-                // Compact streaming output averages roughly 20–30 bytes per note.
-                // Start close to the selected cap; retry a chunk at half size if an
-                // unusually long timestamp/duration makes it exceed the byte limit.
+                // The first chunk retains the original song ID. Every later chunk gets
+                // its own data/<song-id>/<song-id>.json and songs/<song-id>/ audio folder,
+                // so Psych Engine can list and load each chart as an independent song.
                 let initial = (cap / 28).max(1).min(10_000_000) as usize;
                 let mut chunk_size = initial.max(1);
                 let mut start = 0usize;
                 while start < plan.notes.len() {
+                    let part_number = part_count + 1;
+                    let part_id = if part_number == 1 {
+                        id.clone()
+                    } else {
+                        format!("{id}-part-{part_number:03}")
+                    };
+                    // Keep the chart's display name human-readable while suffixing it
+                    // in the same way song_id() derives the corresponding folder ID.
+                    let part_chart_name = if part_number == 1 {
+                        plan.song.clone()
+                    } else {
+                        format!("{}-part-{part_number:03}", plan.song)
+                    };
                     let mut end = start.saturating_add(chunk_size).min(plan.notes.len());
                     let (temp_path, bytes) = loop {
-                        let candidate_path = unique_temp_path(&data_dir, "part");
+                        let candidate_path = unique_temp_path(&data_root, "part");
                         match write_chart_file(
                             &candidate_path, plan, &plan.notes[start..end], pitch_map,
-                            min_pitch, max_pitch, true, cap,
+                            min_pitch, max_pitch, true, cap, &part_chart_name,
                         ) {
                             Ok(bytes) => break (candidate_path, bytes),
                             Err(e) if e.starts_with("SPLIT_REQUIRED:") => {
@@ -978,54 +973,65 @@ impl App {
                         }
                     };
 
-                    let file_name = if part_count == 0 {
-                        format!("{id}.json")
-                    } else {
-                        format!("{id}-part-{:03}.json", part_count + 1)
-                    };
-                    let final_path = data_dir.join(&file_name);
+                    let part_data_dir = data_root.join(&part_id);
+                    fs::create_dir_all(&part_data_dir).map_err(|e| e.to_string())?;
+                    let file_name = format!("{part_id}.json");
+                    let final_path = part_data_dir.join(&file_name);
                     if final_path.exists() { fs::remove_file(&final_path).map_err(|e| e.to_string())?; }
                     fs::rename(&temp_path, &final_path).map_err(|e| format!("Couldn't finalize JSON part: {e}"))?;
 
                     let slice = &plan.notes[start..end];
                     part_metadata.push(serde_json::json!({
-                        "file": file_name, "bytes": bytes, "notes": slice.len(),
+                        "songId": part_id,
+                        "file": format!("data/{part_id}/{file_name}"), "bytes": bytes, "notes": slice.len(),
                         "firstNoteMs": slice.first().map(|n| n.ms),
                         "lastNoteMs": slice.last().map(|n| n.ms)
                     }));
+                    song_ids.push(part_id);
                     total_bytes = total_bytes.saturating_add(bytes);
                     part_count += 1;
                     start = end;
                 }
                 if part_count > 1 {
                     let manifest = serde_json::json!({
-                        "format": "midi-to-psych-rust-split-v1",
-                        "song": plan.song,
+                        "format": "midi-to-psych-rust-split-songs-v2",
+                        "originalSong": plan.song,
                         "maxPartBytes": cap,
                         "partCount": part_count,
+                        "partsAreSeparateSongs": true,
+                        "audioBehavior": "Each part has its own Inst.ogg and optional Voices.ogg folders, copied from the full original audio. Chart note timestamps remain at their original positions, so each part plays against the full-length audio and contains only its assigned notes.",
                         "parts": part_metadata,
-                        "compatibilityWarning": "Stock Psych Engine loads only the primary song JSON and does not automatically merge these parts. A split-aware loader or merge step is required to play the complete chart as one song."
+                        "compatibilityNote": "Each part is listed as a separate song in the generated Week JSON. Standard Psych Engine does not merge the parts into one chart; play a part to hear the full original audio with only that part's notes."
                     });
+                    let manifest_dir = data_root.join(&id);
+                    fs::create_dir_all(&manifest_dir).map_err(|e| e.to_string())?;
                     fs::write(
-                        data_dir.join(format!("{id}.split-manifest.json")),
+                        manifest_dir.join(format!("{id}.split-manifest.json")),
                         serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
                     ).map_err(|e| e.to_string())?;
                 }
             }
 
-            let song_dir = folder.join("songs").join(&id);
-            fs::create_dir_all(&song_dir).map_err(|e| e.to_string())?;
-            fs::copy(&plan.inst_audio, song_dir.join("Inst.ogg"))
-                .map_err(|e| format!("Couldn't copy instrumental audio: {e}"))?;
-            if let Some(vocals) = &plan.vocals_audio {
-                fs::copy(vocals, song_dir.join("Voices.ogg"))
-                    .map_err(|e| format!("Couldn't copy vocals audio: {e}"))?;
+            // Each chart has its own song folder. The complete source audio is copied
+            // into every song folder, and the chart keeps original note timestamps.
+            for song_id in &song_ids {
+                let song_dir = folder.join("songs").join(song_id);
+                fs::create_dir_all(&song_dir).map_err(|e| e.to_string())?;
+                fs::copy(&plan.inst_audio, song_dir.join("Inst.ogg"))
+                    .map_err(|e| format!("Couldn't copy instrumental audio for {song_id}: {e}"))?;
+                if let Some(vocals) = &plan.vocals_audio {
+                    fs::copy(vocals, song_dir.join("Voices.ogg"))
+                        .map_err(|e| format!("Couldn't copy vocals audio for {song_id}: {e}"))?;
+                }
             }
 
             let weeks_dir = folder.join("weeks");
             fs::create_dir_all(&weeks_dir).map_err(|e| e.to_string())?;
+            let week_songs: Vec<serde_json::Value> = song_ids.iter()
+                .map(|song_id| serde_json::json!([song_id, plan.opponent, [146, 113, 253]]))
+                .collect();
             let week = serde_json::json!({
-                "songs": [[id, plan.opponent, [146, 113, 253]]],
+                "songs": week_songs,
                 "hiddenUntilUnlocked": false,
                 "hideFreeplay": false,
                 "weekBackground": plan.stage,
@@ -1052,14 +1058,19 @@ impl App {
             fs::write(folder.join("pack.json"), serde_json::to_string_pretty(&pack).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
             let split_readme = if part_count > 1 {
-                format!("\n\nSPLIT CHART WARNING: The primary chart is {id}.json and additional files are named {id}-part-002.json, etc. Stock Psych Engine does not automatically merge them. See data/{id}/{id}.split-manifest.json for the file list and note ranges; a split-aware loader or merge step is required for the entire chart.")
+                format!("\n\nSPLIT CHARTS: The original chart was split into {part_count} separate songs. Each entry is listed in weeks/week-{id}.json. Each part has its own chart under data/<song-id>/<song-id>.json and its own audio under songs/<song-id>/. Every part uses the full original audio and contains only its assigned notes, retaining their original timestamps. The manifest is data/{id}/{id}.split-manifest.json. Selecting one part does not automatically play notes from the other parts.")
             } else { String::new() };
+            let chart_readme = if split && part_count > 1 {
+                format!("The exported split songs are listed in weeks/week-{id}.json. See data/{id}/{id}.split-manifest.json for the complete chart-part list.")
+            } else {
+                format!("The chart is in data/{id}/{id}.json.")
+            };
             fs::write(folder.join("MIDI-TO-PSYCH-README.txt"), format!(
-                "Generated by MIDI to Psych Rust\nMod: {mod_name}\nSong: {song}\nScroll speed: {speed}\nMapping: {mapping:?}\nStyle: {style}\nVocals: {vocals}\nJSON size cap: {cap}\n\nInstall by placing this mod folder in your Psych Engine mods directory. The chart is in data/{id}/{id}.json, audio is in songs/{id}/, and the week file is in weeks/week-{id}.json. Vocals, when supplied, are exported as Voices.ogg (Psych Engine's expected filename).{split_readme}",
+                "Generated by MIDI to Psych Rust\nMod: {mod_name}\nSong: {song}\nScroll speed: {speed}\nMapping: {mapping:?}\nStyle: {style}\nVocals: {vocals}\nJSON size cap: {cap}\n\nInstall by placing this mod folder in your Psych Engine mods directory. {chart_readme} Audio folders are under songs/<song-id>/. The week file is in weeks/week-{id}.json. Vocals, when supplied, are exported as Voices.ogg (Psych Engine's expected filename).{split_readme}",
                 mod_name=plan.mod_name, song=plan.song, speed=plan.speed, mapping=plan.mapping,
                 style=plan.style.label(), cap=plan.cap.label(),
                 vocals=if plan.vocals_audio.is_some() { "included" } else { "not included (instrumental-only)" },
-                id=id, split_readme=split_readme
+                id=id, chart_readme=chart_readme, split_readme=split_readme
             )).map_err(|e| e.to_string())?;
             Ok((part_count, total_bytes))
         })();
