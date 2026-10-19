@@ -649,6 +649,7 @@ struct PendingExport {
     mod_name: String,
     include_template: bool,
     cap: JsonCap,
+    max_notes_per_part: usize,
     estimated_bytes: u64,
 }
 fn estimate_json_bytes(notes: &[Note], bpm: f64) -> u64 {
@@ -678,7 +679,7 @@ struct App {
     song: String, output: Option<PathBuf>, player: String, opponent: String, stage: String,
     speed_input: String, sustain: bool, status: String, error: bool, info1: Option<MidiInfo>, info2: Option<MidiInfo>,
     inst_audio: Option<PathBuf>, vocals_audio: Option<PathBuf>, mod_name: String, include_template: bool,
-    json_cap: JsonCap, pending_export: Option<PendingExport>, split_prompt: bool,
+    json_cap: JsonCap, max_notes_per_split_input: String, pending_export: Option<PendingExport>, split_prompt: bool,
     load_rx: Option<Receiver<MidiLoadMessage>>,
 }
 impl Default for App {
@@ -686,7 +687,7 @@ impl Default for App {
         song:"My Song".into(),output:None,player:"bf".into(),opponent:"dad".into(),stage:"stage".into(),speed_input:"2.5".into(),
         sustain:true,status:"Ready when you are. Load a MIDI and your instrumental audio.".into(),error:false,
         info1:None,info2:None,inst_audio:None,vocals_audio:None,mod_name:"My-MIDI-Mod".into(),include_template:false,
-        json_cap:JsonCap::Gb21,pending_export:None,split_prompt:false,load_rx:None} }
+        json_cap:JsonCap::Gb21,max_notes_per_split_input:"10".into(),pending_export:None,split_prompt:false,load_rx:None} }
 }
 impl App {
     fn start_midi_load(&mut self, first: bool, path: PathBuf) -> bool {
@@ -788,6 +789,15 @@ impl App {
             Ok(v) if v.is_finite() && (1.0..=1000.0).contains(&v) => v,
             _ => { self.status="Scroll speed must be a number from 1 to 1000.".into();self.error=true;return; }
         };
+        // The UI accepts a fractional number of millions, e.g. 12.5 means 12,500,000 notes.
+        let max_notes_per_part = match self.max_notes_per_split_input.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() && (10.0..=100.0).contains(&v) => (v * 1_000_000.0) as usize,
+            _ => {
+                self.status="Max notes per split must be a number from 10 to 100 (millions of notes).".into();
+                self.error=true;
+                return;
+            }
+        };
         // Export consumes the large in-memory note vector to avoid duplicating it.
         // If the user exports again, reload off-thread rather than freezing the UI.
         if self.info1.as_ref().map(|info| info.notes.is_empty()).unwrap_or(true) {
@@ -841,10 +851,13 @@ impl App {
             opponent:self.opponent.trim().to_string(), stage:self.stage.trim().to_string(), mapping:self.mapping,
             style:self.style, pitch_map, dual:self.mode==Mode::Dual, sustain:self.sustain, needs_voices:self.vocals_audio.is_some(), inst_audio,
             vocals_audio:self.vocals_audio.clone(), mod_name:self.mod_name.trim().to_string(),
-            include_template:self.include_template, cap:self.json_cap, estimated_bytes:0,
+            include_template:self.include_template, cap:self.json_cap, max_notes_per_part, estimated_bytes:0,
         };
         plan.estimated_bytes=estimate_json_bytes(&plan.notes,plan.bpm);
-        if plan.estimated_bytes >= plan.cap.bytes() || plan.estimated_bytes >= MAX_JSON_BYTES {
+        if plan.estimated_bytes >= plan.cap.bytes()
+            || plan.estimated_bytes >= MAX_JSON_BYTES
+            || plan.notes.len() > plan.max_notes_per_part
+        {
             self.open_split_prompt(plan);
             return;
         }
@@ -937,7 +950,9 @@ impl App {
                 // The first chunk retains the original song ID. Every later chunk gets
                 // its own data/<song-id>/<song-id>.json and songs/<song-id>/ audio folder,
                 // so Psych Engine can list and load each chart as an independent song.
-                let initial = (cap / 28).max(1).min(10_000_000) as usize;
+                // Use the user-selected note limit, while still starting conservatively
+                // based on the JSON-size cap. The actual serialized size is checked below.
+                let initial = (cap / 28).max(1).min(plan.max_notes_per_part as u64) as usize;
                 let mut chunk_size = initial.max(1);
                 let mut start = 0usize;
                 while start < plan.notes.len() {
@@ -997,6 +1012,7 @@ impl App {
                         "format": "midi-to-psych-rust-split-songs-v2",
                         "originalSong": plan.song,
                         "maxPartBytes": cap,
+                        "maxPartNotes": plan.max_notes_per_part,
                         "partCount": part_count,
                         "partsAreSeparateSongs": true,
                         "audioBehavior": "Each part has its own Inst.ogg and optional Voices.ogg folders, copied from the full original audio. Chart note timestamps remain at their original positions, so each part plays against the full-length audio and contains only its assigned notes.",
@@ -1066,9 +1082,9 @@ impl App {
                 format!("The chart is in data/{id}/{id}.json.")
             };
             fs::write(folder.join("MIDI-TO-PSYCH-README.txt"), format!(
-                "Generated by MIDI to Psych Rust\nMod: {mod_name}\nSong: {song}\nScroll speed: {speed}\nMapping: {mapping:?}\nStyle: {style}\nVocals: {vocals}\nJSON size cap: {cap}\n\nInstall by placing this mod folder in your Psych Engine mods directory. {chart_readme} Audio folders are under songs/<song-id>/. The week file is in weeks/week-{id}.json. Vocals, when supplied, are exported as Voices.ogg (Psych Engine's expected filename).{split_readme}",
+                "Generated by MIDI to Psych Rust\nMod: {mod_name}\nSong: {song}\nScroll speed: {speed}\nMapping: {mapping:?}\nStyle: {style}\nVocals: {vocals}\nJSON size cap: {cap}\nMax notes per split: {max_notes}\n\nInstall by placing this mod folder in your Psych Engine mods directory. {chart_readme} Audio folders are under songs/<song-id>/. The week file is in weeks/week-{id}.json. Vocals, when supplied, are exported as Voices.ogg (Psych Engine's expected filename).{split_readme}",
                 mod_name=plan.mod_name, song=plan.song, speed=plan.speed, mapping=plan.mapping,
-                style=plan.style.label(), cap=plan.cap.label(),
+                style=plan.style.label(), cap=plan.cap.label(), max_notes=plan.max_notes_per_part,
                 vocals=if plan.vocals_audio.is_some() { "included" } else { "not included (instrumental-only)" },
                 id=id, chart_readme=chart_readme, split_readme=split_readme
             )).map_err(|e| e.to_string())?;
@@ -1182,6 +1198,12 @@ impl eframe::App for App {
                         for cap in JsonCap::ALL { ui.selectable_value(&mut self.json_cap,cap,cap.label()); }
                     });
                     ui.small("Caps: 250 MB, 500 MB, 1 GB, 1.5 GB, 2 GB, 2.1 GB. Absolute maximum: 2.1 GB.");
+                    ui.add_space(6.0);
+                    ui.label("Max notes per split (millions)");
+                    ui.add(egui::TextEdit::singleline(&mut self.max_notes_per_split_input)
+                        .desired_width(120.0).hint_text("10–100"));
+                    ui.small("Enter 10–100; decimals are allowed (e.g. 12.5 = 12.5 million notes).");
+                    ui.small("A split starts when this note limit or the JSON size cap is reached.");
                     ui.small("The export includes data JSON, song audio, and a Week JSON file.");
                 });
             });
@@ -1211,18 +1233,26 @@ impl eframe::App for App {
             });
         });
         if self.split_prompt {
-            let (cap_label,estimated,hard_max)=self.pending_export.as_ref().map(|p| {
-                let label = if p.cap.bytes() < MAX_JSON_BYTES { p.cap.label() } else { "2.1 GB maximum" };
-                (label, p.estimated_bytes, p.estimated_bytes >= MAX_JSON_BYTES)
-            }).unwrap_or(("2.1 GB",0,false));
+            let (reason,estimated,hard_max)=self.pending_export.as_ref().map(|p| {
+                let size_limit_reached = p.estimated_bytes >= p.cap.bytes() || p.estimated_bytes >= MAX_JSON_BYTES;
+                let notes_limit_reached = p.notes.len() > p.max_notes_per_part;
+                let size_label = if p.cap.bytes() < MAX_JSON_BYTES { p.cap.label() } else { "2.1 GB maximum" };
+                let reason = match (size_limit_reached, notes_limit_reached) {
+                    (true, true) => format!("The chart reached the JSON-size limit and the {:.1} million-note split limit.", p.max_notes_per_part as f64 / 1_000_000.0),
+                    (true, false) => format!("Hey! You reached {size_label}."),
+                    (false, true) => format!("You reached the {:.1} million-note split limit.", p.max_notes_per_part as f64 / 1_000_000.0),
+                    (false, false) => "The chart reached an export limit.".to_string(),
+                };
+                (reason, p.estimated_bytes, p.estimated_bytes >= MAX_JSON_BYTES)
+            }).unwrap_or(("Export limit reached".to_string(),0,false));
             let mut split_now=false;
             let mut not_yet=false;
-            egui::Window::new("JSON size limit reached")
+            egui::Window::new("Export limit reached")
                 .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER,[0.0,0.0]).show(ctx,|ui|{
                     ui.set_min_width(390.0);
-                    ui.label(egui::RichText::new(format!("Hey! You reached {cap_label}.")).strong());
-                    ui.label("You can split JSONs now, or the file may become too large to read.");
-                    ui.label("You have until 2.1 GB or it may not make it.");
+                    ui.label(egui::RichText::new(&reason).strong());
+                    ui.label("You can split the chart now, or try exporting it as one file.");
+                    ui.label("The hard JSON writing limit remains 2.1 GB.");
                     ui.label(format!("Estimated chart JSON size: {}",pretty_bytes(estimated)));
                     ui.add_space(4.0);
                     if hard_max { ui.colored_label(egui::Color32::from_rgb(255,145,115),"No Later will try one file, but writing stops at the 2.1 GB maximum."); }
