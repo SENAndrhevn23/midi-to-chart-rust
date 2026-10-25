@@ -17,14 +17,15 @@ enum Mode { Single, Dual }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mapping { AccurateRanges, Adaptive, SmartBalance }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Style { Classic, Stream, ChordFriendly, Midi2PsychMapping }
+enum Style { Classic, Stream, ChordFriendly, Midi2PsychMapping, Midi2PsychExact }
 impl Style {
     fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
             Self::Stream => "Stream",
             Self::ChordFriendly => "Chord-friendly",
-            Self::Midi2PsychMapping => "Midi2Psych Mapping",
+            Self::Midi2PsychMapping => "Midi2Psych Mapping (legacy)",
+            Self::Midi2PsychExact => "MIDI2Psych Exact",
         }
     }
 }
@@ -427,8 +428,82 @@ fn apply_midi2psych_placement(notes: &mut [Note], bpm: f64, dual: bool, pitch_ma
     }
 }
 
+// Faithful port of MIDI2Psych's collision-placement pass from
+// src/psych_converter.cpp::redistributeSimultaneousNotes.
+// The C++ implementation sorts by time then lane, groups contiguous same-lane
+// notes within 1 ms, and moves collisions evenly toward the next note in that
+// lane only when both notes remain in the same four-beat section.
+fn apply_midi2psych_exact_placement(notes: &mut [Note], bpm: f64, dual: bool, pitch_map: &[i32; 128]) {
+    if notes.len() < 2 { return; }
+
+    let lane_of = |n: &Note| midi2psych_lane(n, pitch_map, dual);
+    let sort_by_time = |a: &Note, b: &Note| {
+        a.ms.total_cmp(&b.ms)
+            .then(lane_of(a).cmp(&lane_of(b)))
+    };
+
+    if notes.len() > 10_000 {
+        notes.par_sort_unstable_by(sort_by_time);
+    } else {
+        notes.sort_unstable_by(sort_by_time);
+    }
+
+    let section_ms = (60_000.0 / bpm.max(1.0)) * 4.0;
+    const EPSILON_MS: f64 = 0.001;
+    let mut i = 0usize;
+    while i < notes.len() {
+        let current_lane = lane_of(&notes[i]);
+        let current_time = notes[i].ms;
+        let group_start = i;
+        let mut group_end = i + 1;
+
+        while group_end < notes.len()
+            && lane_of(&notes[group_end]) == current_lane
+            && (notes[group_end].ms - current_time).abs() < EPSILON_MS
+        {
+            group_end += 1;
+        }
+
+        if group_end - group_start > 1 {
+            let mut next_same_idx = group_end;
+            while next_same_idx < notes.len() && lane_of(&notes[next_same_idx]) != current_lane {
+                next_same_idx += 1;
+            }
+
+            if next_same_idx < notes.len() {
+                let next_time = notes[next_same_idx].ms;
+                let current_section = (current_time / section_ms).floor();
+                let next_section = (next_time / section_ms).floor();
+
+                if current_section == next_section && next_time > current_time {
+                    let group_size = group_end - group_start;
+                    let time_step = (next_time - current_time) / (group_size + 1) as f64;
+                    for j in group_start..group_end {
+                        let shifted_time = current_time + time_step * (j - group_start + 1) as f64;
+                        let delta = shifted_time - notes[j].ms;
+                        notes[j].ms = shifted_time;
+                        // Rust stores sustain end timestamps, while MIDI2Psych stores
+                        // durations. Shift both endpoints to preserve hold length.
+                        notes[j].end_ms += delta;
+                    }
+                }
+            }
+        }
+        i = group_end;
+    }
+
+    // The reference C++ pass leaves the vector in its pre-placement order.
+    // Re-sort here after reproducing its timestamp edits so section serialization
+    // remains chronologically ordered, which the Rust exporter relies on.
+    if notes.len() > 10_000 {
+        notes.par_sort_unstable_by(sort_by_time);
+    } else {
+        notes.sort_unstable_by(sort_by_time);
+    }
+}
+
 fn mapped_base_lane(note: &Note, plan: &PendingExport, pitch_map: &[i32; 128], min: u8, max: u8) -> i32 {
-    let mut mapped = if plan.style == Style::Midi2PsychMapping || plan.mapping == Mapping::SmartBalance {
+    let mut mapped = if matches!(plan.style, Style::Midi2PsychMapping | Style::Midi2PsychExact) || plan.mapping == Mapping::SmartBalance {
         pitch_map[note.pitch as usize]
     } else {
         lane(note.pitch, min, max, plan.mapping)
@@ -443,7 +518,7 @@ fn mapped_base_lane(note: &Note, plan: &PendingExport, pitch_map: &[i32; 128], m
 
 fn output_lane(note: &Note, plan: &PendingExport, pitch_map: &[i32; 128], min: u8, max: u8, must_hit_section: bool) -> i32 {
     let mapped = mapped_base_lane(note, plan, pitch_map, min, max);
-    if plan.style == Style::Midi2PsychMapping && plan.dual {
+    if matches!(plan.style, Style::Midi2PsychMapping | Style::Midi2PsychExact) && plan.dual {
         // Match MIDI2Psych's section-aware player/opponent orientation. The
         // section with more P1 notes is player-led; ties favour P1.
         if must_hit_section {
@@ -451,7 +526,7 @@ fn output_lane(note: &Note, plan: &PendingExport, pitch_map: &[i32; 128], min: u
         } else if note.player_two { mapped } else { mapped + 4 }
     } else {
         // Keep the legacy lane behavior for the other chart styles.
-        let is_opponent = if plan.style == Style::Midi2PsychMapping {
+        let is_opponent = if matches!(plan.style, Style::Midi2PsychMapping | Style::Midi2PsychExact) {
             plan.dual && note.player_two
         } else {
             plan.dual && (note.channel == 1 || note.track % 2 == 1)
@@ -508,7 +583,7 @@ fn write_chart_json<W: Write>(
             note_idx += 1;
         }
         let section_end = note_idx;
-        let must_hit_section = if plan.style == Style::Midi2PsychMapping && plan.dual {
+        let must_hit_section = if matches!(plan.style, Style::Midi2PsychMapping | Style::Midi2PsychExact) && plan.dual {
             if section_start == section_end {
                 last_must_hit
             } else {
@@ -687,7 +762,7 @@ impl Default for App {
         song:"My Song".into(),output:None,player:"bf".into(),opponent:"dad".into(),stage:"stage".into(),speed_input:"2.5".into(),
         sustain:true,status:"Ready when you are. Load a MIDI and your instrumental audio.".into(),error:false,
         info1:None,info2:None,inst_audio:None,vocals_audio:None,mod_name:"My-MIDI-Mod".into(),include_template:false,
-        json_cap:JsonCap::Gb21,max_notes_per_split_input:"10".into(),pending_export:None,split_prompt:false,load_rx:None} }
+        json_cap:JsonCap::Gb21,max_notes_per_split_input:"100".into(),pending_export:None,split_prompt:false,load_rx:None} }
 }
 impl App {
     fn start_midi_load(&mut self, first: bool, path: PathBuf) -> bool {
@@ -836,9 +911,11 @@ impl App {
                 notes.append(&mut second_notes);
             }
         }
-        let uses_histogram_mapper = self.style == Style::Midi2PsychMapping || self.mapping == Mapping::SmartBalance;
+        let uses_histogram_mapper = matches!(self.style, Style::Midi2PsychMapping | Style::Midi2PsychExact) || self.mapping == Mapping::SmartBalance;
         let pitch_map = if uses_histogram_mapper { balanced_pitch_map(&notes) } else { [0i32; 128] };
-        if self.style == Style::Midi2PsychMapping {
+        if self.style == Style::Midi2PsychExact {
+            apply_midi2psych_exact_placement(&mut notes, bpm, self.mode == Mode::Dual, &pitch_map);
+        } else if self.style == Style::Midi2PsychMapping {
             apply_midi2psych_placement(&mut notes, bpm, self.mode == Mode::Dual, &pitch_map);
         } else if notes.len() > 10_000 {
             notes.par_sort_unstable_by(|a, b| a.ms.total_cmp(&b.ms).then(a.pitch.cmp(&b.pitch)));
@@ -1172,10 +1249,13 @@ impl eframe::App for App {
                         ui.selectable_value(&mut self.style,Style::Classic,"Classic");
                         ui.selectable_value(&mut self.style,Style::Stream,"Stream");
                         ui.selectable_value(&mut self.style,Style::ChordFriendly,"Chord-friendly");
-                        ui.selectable_value(&mut self.style,Style::Midi2PsychMapping,"Midi2Psych Mapping");
+                        ui.selectable_value(&mut self.style,Style::Midi2PsychMapping,"Midi2Psych Mapping (legacy)");
+                        ui.selectable_value(&mut self.style,Style::Midi2PsychExact,"MIDI2Psych Exact");
                     });
-                    if self.style == Style::Midi2PsychMapping {
-                        ui.small("Uses MIDI2Psych histogram balancing and same-lane collision placement.");
+                    if self.style == Style::Midi2PsychExact {
+                        ui.small("Ports MIDI2Psych's greedy pitch histogram and 1 ms same-lane collision placement from the supplied C++ source.");
+                    } else if self.style == Style::Midi2PsychMapping {
+                        ui.small("Uses the earlier Rust MIDI2Psych-style mapping and collision placement.");
                     }
                     ui.checkbox(&mut self.sustain,"Preserve sustain durations");
                     ui.horizontal(|ui| {
@@ -1200,10 +1280,23 @@ impl eframe::App for App {
                     ui.small("Caps: 250 MB, 500 MB, 1 GB, 1.5 GB, 2 GB, 2.1 GB. Absolute maximum: 2.1 GB.");
                     ui.add_space(6.0);
                     ui.label("Max notes per split (millions)");
-                    ui.add(egui::TextEdit::singleline(&mut self.max_notes_per_split_input)
-                        .desired_width(120.0).hint_text("10–100"));
-                    ui.small("Enter 10–100; decimals are allowed (e.g. 12.5 = 12.5 million notes).");
-                    ui.small("A split starts when this note limit or the JSON size cap is reached.");
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in [10, 25, 50, 75, 100] {
+                            if ui.selectable_label(
+                                self.max_notes_per_split_input.trim() == preset.to_string(),
+                                format!("{preset}M")
+                            ).clicked() {
+                                self.max_notes_per_split_input = preset.to_string();
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Custom (millions):");
+                        ui.add(egui::TextEdit::singleline(&mut self.max_notes_per_split_input)
+                            .desired_width(100.0).hint_text("10–100"));
+                    });
+                    ui.small("Choose a preset or enter 10–100; decimals are allowed (e.g. 12.5 = 12.5 million notes).");
+                    ui.small("Default: 100 million. A split can still happen earlier if the JSON size cap is reached.");
                     ui.small("The export includes data JSON, song audio, and a Week JSON file.");
                 });
             });
